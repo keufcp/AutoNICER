@@ -276,9 +276,18 @@ class NicerGui:
     def stop(self):
         global running
         running = False
-        # 4パターン処理も停止
+        self.threadKiller.set()
+        
+        # 4パターン処理も安全に停止
         if self.pattern_thread and self.pattern_thread.is_alive():
-            self.threadKiller.set()
+            print_msg("Stopping 4-pattern enhancement...", 2)
+            try:
+                # 短時間待機してスレッドの自然終了を待つ
+                self.pattern_thread.join(timeout=1.0)
+                if self.pattern_thread.is_alive():
+                    print_msg("4-pattern thread did not stop gracefully", 1)
+            except Exception as e:
+                print_msg(f"Error stopping 4-pattern thread: {e}", 1)
     
     def reset_all_result(self):
         """ reset all result images and filter values (Except for GUI.)"""
@@ -514,14 +523,26 @@ class NicerGui:
         else: 
             fixed_filters = [0.0 for _ in range(config.can_filter_count)]
 
+        # 既存のスレッドが動作中の場合は停止
+        if self.pattern_thread and self.pattern_thread.is_alive():
+            print_msg("Previous 4-pattern process is still running. Please wait or stop it first.", 1)
+            self.nicer_button.config(state="active")
+            return
+
         # 4パターン処理を別スレッドで実行
-        self.pattern_thread = threading.Thread(
-            target=self._enhance_4patterns_worker, 
-            args=(epochs, fixed_filters), 
-            daemon=True
-        )
-        self.pattern_thread.start()
-        self._periodic_check_4patterns()
+        try:
+            self.pattern_thread = threading.Thread(
+                target=self._enhance_4patterns_worker, 
+                args=(epochs, fixed_filters), 
+                daemon=True,
+                name="Pattern4Enhancement"  # スレッドに名前を付けてデバッグを容易に
+            )
+            self.pattern_thread.start()
+            self._periodic_check_4patterns()
+        except Exception as e:
+            print_msg(f"Failed to start 4-pattern enhancement thread: {e}", 1)
+            self.nicer_button.config(state="active")
+            running = False
 
     def _enhance_4patterns_worker(self, epochs, fixed_filters):
         """
@@ -529,63 +550,96 @@ class NicerGui:
         各パターン完了時にキューで結果を通知
         """
         try:
-            # パターン1（panel_num=2）
-            if not self.threadKiller.is_set():
-                self.result_img_two, self.final_filter_two, _ = self.nicer.enhance_image(
-                    self.reference_img1, epochs=epochs, fixFilters=fixed_filters, thread_stopEvent=self.threadKiller
-                )
-                # 完了をキューで通知
-                self.pattern_queue.put(('pattern_complete', 2, self.final_filter_two))
+            patterns = [
+                ('result_img_two', 'final_filter_two', 2),
+                ('result_img_three', 'final_filter_three', 3), 
+                ('result_img_four', 'final_filter_four', 4),
+                ('result_img_five', 'final_filter_five', 5)
+            ]
+            
+            for img_attr, filter_attr, panel_num in patterns:
+                # スレッド停止チェック
+                if self.threadKiller.is_set():
+                    print_msg("4-pattern enhancement stopped by user", 2)
+                    return
+                
+                try:
+                    # 画像改善処理
+                    result_img, final_filter, _ = self.nicer.enhance_image(
+                        self.reference_img1, epochs=epochs, fixFilters=fixed_filters, 
+                        thread_stopEvent=self.threadKiller
+                    )
+                    
+                    # 結果を安全に保存（メインスレッドからのアクセスを考慮）
+                    setattr(self, img_attr, result_img)
+                    setattr(self, filter_attr, final_filter)
+                    
+                    # 完了をキューで通知
+                    self.pattern_queue.put(('pattern_complete', panel_num, final_filter))
+                    
+                except Exception as pattern_error:
+                    print_msg(f"Error in pattern {panel_num-1} enhancement: {pattern_error}", 1)
+                    self.pattern_queue.put(('pattern_error', panel_num, str(pattern_error)))
+                    continue  # 次のパターンを続行
 
-            # パターン2（panel_num=3）
-            if not self.threadKiller.is_set():
-                self.result_img_three, self.final_filter_three, _ = self.nicer.enhance_image(
-                    self.reference_img1, epochs=epochs, fixFilters=fixed_filters, thread_stopEvent=self.threadKiller
-                )
-                self.pattern_queue.put(('pattern_complete', 3, self.final_filter_three))
-
-            # パターン3（panel_num=4）
-            if not self.threadKiller.is_set():
-                self.result_img_four, self.final_filter_four, _ = self.nicer.enhance_image(
-                    self.reference_img1, epochs=epochs, fixFilters=fixed_filters, thread_stopEvent=self.threadKiller
-                )
-                self.pattern_queue.put(('pattern_complete', 4, self.final_filter_four))
-
-            # パターン4（panel_num=5）
-            if not self.threadKiller.is_set():
-                self.result_img_five, self.final_filter_five, _ = self.nicer.enhance_image(
-                    self.reference_img1, epochs=epochs, fixFilters=fixed_filters, thread_stopEvent=self.threadKiller
-                )
-                self.pattern_queue.put(('pattern_complete', 5, self.final_filter_five))
-
-            # 全パターン完了を通知
+            # 全パターン完了を通知（停止されていない場合のみ）
             if not self.threadKiller.is_set():
                 self.pattern_queue.put(('all_complete',))
             
         except Exception as e:
-            print_msg(f"Error in 4-pattern enhancement: {e}", 1)
+            print_msg(f"Critical error in 4-pattern enhancement: {e}", 1)
             self.pattern_queue.put(('error', str(e)))
+        finally:
+            # 必要に応じてリソースクリーンアップ
+            print_msg("4-pattern enhancement worker finished", 3)
 
     def _periodic_check_4patterns(self):
         """
         4パターン処理の進行状況を定期的にチェックし、UIを更新
         """
+        # キューをチェックして結果を処理
         self._check_pattern_queue()
         
-        if self.pattern_thread.is_alive() and running:
+        # スレッドの状態を安全にチェック
+        if self.pattern_thread and self.pattern_thread.is_alive() and running:
             # スレッドがまだ実行中の場合、100ms後に再チェック
             self.master.after(100, self._periodic_check_4patterns)
-        elif not self.pattern_thread.is_alive() and running:
+        elif self.pattern_thread and not self.pattern_thread.is_alive() and running:
             # スレッドが正常終了した場合
+            self._finalize_4pattern_processing(completed=True)
+        elif not running:
+            # プロセスが停止された場合
+            self._finalize_4pattern_processing(completed=False)
+
+    def _finalize_4pattern_processing(self, completed=True):
+        """
+        4パターン処理の終了処理を行う
+        """
+        global running
+        
+        if completed:
             self.print_label['text'] = "4-pattern optimization finished."
-            self.nicer_button.config(state="active")
         else:
-            # スレッドが停止された場合
-            self.threadKiller.set()
-            self.pattern_thread.join()
             self.print_label['text'] = "4-pattern optimization stopped."
-            self.nicer_button.config(state="active")
-            self.threadKiller.clear()
+            
+        # スレッドのクリーンアップ
+        if self.pattern_thread and self.pattern_thread.is_alive():
+            self.threadKiller.set()
+            try:
+                self.pattern_thread.join(timeout=2.0)  # 最大2秒待機
+                if self.pattern_thread.is_alive():
+                    print_msg("Warning: Pattern thread did not terminate cleanly", 1)
+            except Exception as e:
+                print_msg(f"Error joining pattern thread: {e}", 1)
+        
+        # UI状態をリセット
+        self.nicer_button.config(state="active")
+        
+        # イベントをクリア（次回の処理のため）
+        self.threadKiller.clear()
+        
+        # スレッド参照をクリア
+        self.pattern_thread = None
 
     def _check_pattern_queue(self):
         """
@@ -593,27 +647,48 @@ class NicerGui:
         """
         try:
             while not self.pattern_queue.empty():
-                message = self.pattern_queue.get_nowait()
-                
-                if message[0] == 'pattern_complete':
-                    # 個別パターンの完了処理
-                    panel_num = message[1]
-                    filter_list = message[2]
-                    self.preview(filterList=filter_list, panel_num=panel_num)
-                    self.print_label['text'] = f"Pattern {panel_num-1} completed."
+                try:
+                    message = self.pattern_queue.get_nowait()
                     
-                elif message[0] == 'all_complete':
-                    # 全パターン完了処理
-                    self.print_label['text'] = "All 4 patterns completed successfully."
-                    
-                elif message[0] == 'error':
-                    # エラー処理
-                    error_msg = message[1]
-                    self.print_label['text'] = f"Error: {error_msg}"
-                    print_msg(f"4-pattern enhancement error: {error_msg}", 1)
+                    if message[0] == 'pattern_complete':
+                        # 個別パターンの完了処理
+                        panel_num = message[1]
+                        filter_list = message[2]
+                        try:
+                            self.preview(filterList=filter_list, panel_num=panel_num)
+                            self.print_label['text'] = f"Pattern {panel_num-1} completed."
+                        except Exception as preview_error:
+                            print_msg(f"Error updating preview for pattern {panel_num-1}: {preview_error}", 1)
+                        
+                    elif message[0] == 'pattern_error':
+                        # 個別パターンのエラー処理
+                        panel_num = message[1]
+                        error_msg = message[2]
+                        self.print_label['text'] = f"Pattern {panel_num-1} failed: {error_msg}"
+                        print_msg(f"Pattern {panel_num-1} enhancement error: {error_msg}", 1)
+                        
+                    elif message[0] == 'all_complete':
+                        # 全パターン完了処理
+                        self.print_label['text'] = "All 4 patterns completed successfully."
+                        
+                    elif message[0] == 'error':
+                        # 重大エラー処理
+                        error_msg = message[1]
+                        self.print_label['text'] = f"Critical error: {error_msg}"
+                        print_msg(f"4-pattern enhancement critical error: {error_msg}", 1)
+                        # 重大エラーの場合は処理を停止
+                        global running
+                        running = False
+                        
+                except (IndexError, TypeError) as msg_error:
+                    print_msg(f"Invalid message format in pattern queue: {msg_error}", 1)
+                    continue
                     
         except queue.Empty:
+            # キューが空の場合は正常（処理なし）
             pass
+        except Exception as queue_error:
+            print_msg(f"Error processing pattern queue: {queue_error}", 1)
     
     #? 選択ボタンの処理
     def picked_1(self):
