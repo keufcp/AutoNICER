@@ -18,9 +18,9 @@ from utils import print_msg
 from enhance_img import NICER
 
 # -------------------------------------------
-# TODO: 別スレッド処理 (nicer_routine_4ptn)
-# TODO: プレビュー画像の動的更新 (nicer_routine_4ptn)
-# TODO: 画面下の説明文の追加
+# TODO: 別スレッド処理 (nicer_routine_4ptn) -> ✅️完了，一部ロジックにハードコードがあるため要修正
+# TODO: プレビュー画像の動的更新 (nicer_routine_4ptn) -> ⚠️部分的に完了
+# TODO: 画面下の説明文の追加 -> ✅️完了
 # TODO: 画像をピックする部分をもっと分かりやすく
 # TODO: 4枚の画像表示後，一呼吸置かないと正常なフィルタが適用されない問題
 # TODO: 画像によってFullSizeを正しく取得できない問題 <- 保存するときに問題となる
@@ -297,7 +297,7 @@ class NicerGui:
 
         filepath = filedialog.askopenfilename(initialdir=os.getcwd(), title="Select an image to open",
                                               filetypes=(
-                                                  ("jpg files", "*.jpg"), ("png files", "*.png"), ("all files", "*.* ")))
+                                                  ("jpg files", "*.jpg"), ("png files", "*.png"), ("all files", "*.*")))
         if filepath is None: return
 
         if filepath.split('.')[-1] in config.supported_extensions:
