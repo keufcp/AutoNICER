@@ -18,9 +18,9 @@ from utils import print_msg
 from enhance_img import NICER
 
 # -------------------------------------------
-# TODO: 別スレッド処理 (nicer_routine_4ptn)
-# TODO: プレビュー画像の動的更新 (nicer_routine_4ptn)
-# TODO: 画面下の説明文の追加
+# TODO: 別スレッド処理 (nicer_routine_4ptn) -> ✅️完了，一部ロジックにハードコードがあるため要修正
+# TODO: プレビュー画像の動的更新 (nicer_routine_4ptn) -> ⚠️部分的に完了
+# TODO: 画面下の説明文の追加 -> ✅️完了
 # TODO: 画像をピックする部分をもっと分かりやすく
 # TODO: 4枚の画像表示後，一呼吸置かないと正常なフィルタが適用されない問題
 # TODO: 画像によってFullSizeを正しく取得できない問題 <- 保存するときに問題となる
@@ -60,6 +60,8 @@ class NicerGui:
         self.helper_y = None
         self.epochCount = None  # for display only
         self.threadKiller = threading.Event()
+        self.pattern_queue = queue.Queue()  # 4パターン処理用のキュー
+        self.pattern_thread = None  # 4パターン処理スレッドの参照
 
         # labels:
         if True:
@@ -273,7 +275,12 @@ class NicerGui:
 
     def stop(self):
         global running
-        running = False
+        # 実行中のスレッドがあれば停止フラグを立てる
+        if (self.pattern_thread and self.pattern_thread.is_alive()) or \
+           (hasattr(self, 'thread') and self.thread and self.thread.is_alive()):
+            print_msg("Stopping current process...", 2)
+            running = False
+            self.threadKiller.set()
     
     def reset_all_result(self):
         """ reset all result images and filter values (Except for GUI.)"""
@@ -490,33 +497,166 @@ class NicerGui:
             return None
     
     def nicer_routine_4ptn(self, epochs=None):
-        self.nicer_button.config(state="disabled")
-        self.master.update_idletasks()  # UIの更新を強制
-        if epochs is None:
-            epochs = int(self.epochBox.get())
-
         """
+        4パターンの画像改善を別スレッドで実行してGUIロックを防ぐ
         結果画像の名前について，pattern数プラス1にインデックスが付与されている
         ex) 結果画像のパターン1ならば，result_img_two
         """
+        global running
+        running = True
+        
+        self.nicer_button.config(state="disabled")
+        self.master.update_idletasks()  # UIの更新を強制
+        
+        if epochs is None:
+            epochs = int(self.epochBox.get())
 
         if self.selected_ptn_filter is not None:
             fixed_filters = self.selected_ptn_filter
-        else: fixed_filters = [0.0 for _ in range(config.can_filter_count)]
+        else: 
+            fixed_filters = [0.0 for _ in range(config.can_filter_count)]
 
-        self.result_img_two, self.final_filter_two, _ = self.nicer.enhance_image(self.reference_img1, epochs=epochs, fixFilters=fixed_filters, thread_stopEvent=self.threadKiller)
-        self.preview(filterList=self.final_filter_two, panel_num=2)
+        # 既存のスレッドが動作中の場合は停止
+        if self.pattern_thread and self.pattern_thread.is_alive():
+            print_msg("Previous 4-pattern process is still running. Please wait or stop it first.", 1)
+            self.nicer_button.config(state="active")
+            return
 
-        self.result_img_three, self.final_filter_three, _ = self.nicer.enhance_image(self.reference_img1, epochs=epochs, fixFilters=fixed_filters, thread_stopEvent=self.threadKiller)
-        self.preview(filterList=self.final_filter_three, panel_num=3)
+        # 4パターン処理を別スレッドで実行
+        try:
+            self.pattern_thread = threading.Thread(
+                target=self._enhance_4patterns_worker, 
+                args=(epochs, fixed_filters), 
+                daemon=True,
+                name="Pattern4Enhancement"  # スレッドに名前を付けてデバッグを容易に
+            )
+            self.pattern_thread.start()
+            self._periodic_check_4patterns()
+        except Exception as e:
+            print_msg(f"Failed to start 4-pattern enhancement thread: {e}", 1)
+            self.nicer_button.config(state="active")
+            running = False
 
-        self.result_img_four, self.final_filter_four, _ = self.nicer.enhance_image(self.reference_img1, epochs=epochs, fixFilters=fixed_filters, thread_stopEvent=self.threadKiller)
-        self.preview(filterList=self.final_filter_four, panel_num=4)
+    def _enhance_4patterns_worker(self, epochs, fixed_filters):
+        """
+        4パターンの画像改善を順次実行するワーカー関数
+        各パターン完了時にキューで結果を通知
+        """
+        try:
+            patterns = [
+                ('result_img_two', 'final_filter_two', 2),
+                ('result_img_three', 'final_filter_three', 3), 
+                ('result_img_four', 'final_filter_four', 4),
+                ('result_img_five', 'final_filter_five', 5)
+            ]
+            
+            for img_attr, filter_attr, panel_num in patterns:
+                # スレッド停止チェック
+                if self.threadKiller.is_set():
+                    print_msg("4-pattern enhancement stopped by user", 2)
+                    return
+                
+                try:
+                    # 画像改善処理
+                    result_img, final_filter, _ = self.nicer.enhance_image(
+                        self.reference_img1, epochs=epochs, fixFilters=fixed_filters, 
+                        thread_stopEvent=self.threadKiller
+                    )
+                    
+                    # 結果を安全に保存（メインスレッドからのアクセスを考慮）
+                    setattr(self, img_attr, result_img)
+                    setattr(self, filter_attr, final_filter)
+                    
+                    # 完了をキューで通知
+                    self.pattern_queue.put(('pattern_complete', panel_num, final_filter))
+                    
+                except Exception as pattern_error:
+                    print_msg(f"Error in pattern {panel_num-1} enhancement: {pattern_error}", 1)
+                    self.pattern_queue.put(('pattern_error', panel_num, str(pattern_error)))
+                    continue  # 次のパターンを続行
 
-        self.result_img_five, self.final_filter_five, _ = self.nicer.enhance_image(self.reference_img1, epochs=epochs, fixFilters=fixed_filters, thread_stopEvent=self.threadKiller)
-        self.preview(filterList=self.final_filter_five, panel_num=5)
+            # 全パターン完了を通知（停止されていない場合のみ）
+            if not self.threadKiller.is_set():
+                self.pattern_queue.put(('all_complete',))
+            
+        except Exception as e:
+            print_msg(f"Critical error in 4-pattern enhancement: {e}", 1)
+            self.pattern_queue.put(('error', str(e)))
+        finally:
+            # 必要に応じてリソースクリーンアップ
+            print_msg("4-pattern enhancement worker finished", 3)
 
-        self.nicer_button.config(state="active")
+    def _periodic_check_4patterns(self):
+        """
+        4パターン処理の進行状況を定期的にチェックし、UIを更新
+        """
+        self._check_pattern_queue()
+
+        if self.pattern_thread and self.pattern_thread.is_alive():
+            # スレッドがまだ実行中の場合、100ms後に再チェック
+            self.master.after(100, self._periodic_check_4patterns)
+        else:
+            # スレッドが終了した場合
+            if running:
+                # スレッドが正常終了した場合
+                # 'all_complete' メッセージで最終表示は更新されるので、ここでは特別な処理は不要
+                pass
+            else:
+                # スレッドがユーザーによって停止された場合
+                self.print_label['text'] = "4-pattern optimization stopped."
+            
+            self.nicer_button.config(state="active")
+            self.threadKiller.clear()
+            self.pattern_thread = None # スレッド参照をクリア
+
+    def _check_pattern_queue(self):
+        """
+        パターン処理のキューをチェックして結果を処理
+        """
+        try:
+            while not self.pattern_queue.empty():
+                try:
+                    message = self.pattern_queue.get_nowait()
+                    
+                    if message[0] == 'pattern_complete':
+                        # 個別パターンの完了処理
+                        panel_num = message[1]
+                        filter_list = message[2]
+                        try:
+                            self.preview(filterList=filter_list, panel_num=panel_num)
+                            self.print_label['text'] = f"Pattern {panel_num-1} completed."
+                        except Exception as preview_error:
+                            print_msg(f"Error updating preview for pattern {panel_num-1}: {preview_error}", 1)
+                        
+                    elif message[0] == 'pattern_error':
+                        # 個別パターンのエラー処理
+                        panel_num = message[1]
+                        error_msg = message[2]
+                        self.print_label['text'] = f"Pattern {panel_num-1} failed: {error_msg}"
+                        print_msg(f"Pattern {panel_num-1} enhancement error: {error_msg}", 1)
+                        
+                    elif message[0] == 'all_complete':
+                        # 全パターン完了処理
+                        self.print_label['text'] = "All 4 patterns completed successfully."
+                        
+                    elif message[0] == 'error':
+                        # 重大エラー処理
+                        error_msg = message[1]
+                        self.print_label['text'] = f"Critical error: {error_msg}"
+                        print_msg(f"4-pattern enhancement critical error: {error_msg}", 1)
+                        # 重大エラーの場合は処理を停止
+                        global running
+                        running = False
+                        
+                except (IndexError, TypeError) as msg_error:
+                    print_msg(f"Invalid message format in pattern queue: {msg_error}", 1)
+                    continue
+                    
+        except queue.Empty:
+            # キューが空の場合は正常（処理なし）
+            pass
+        except Exception as queue_error:
+            print_msg(f"Error processing pattern queue: {queue_error}", 1)
     
     #? 選択ボタンの処理
     def picked_1(self):
@@ -558,8 +698,8 @@ class NicerGui:
         if self.tk_img_panel_two.winfo_ismapped() and self.slider_variables:
             filepath = filedialog.asksaveasfilename(initialdir=os.getcwd(), title="Save the edited image",
                                                     filetypes=(("as jpg file", "*.jpg"),
-                                                               # ("as raw file", "*.png"),
-                                                               ("all files", "*.*")))
+                                                    # ("as raw file", "*.png"),
+                                                    ("all files", "*.*")))
 
             if len(filepath.split('.')) == 1:
                 filepath += '.jpg'
@@ -663,55 +803,29 @@ class NicerGui:
 
     def preview(self, filterList=None, panel_num=2):
         """ apply the currently set slider combination onto the image (using resized img for increased speed) """
-        # check if image is yet available, else do nothing
         if not self.tk_img_panel_one.winfo_ismapped():
             self.print_label['text'] = "Load image first."
             return
-        
-        if panel_num == 1:
-            _, current_gamma = self.get_all_slider_values()
 
-            self.nicer.set_gamma(current_gamma)
-            # self.nicer.set_filters(filterList)
-            preview_image = self.nicer.single_image_pass_can(self.reference_img1, abn=False, filterList=filterList)
-            self.reference_img1_ = Image.fromarray(preview_image)
-            self.display_img_one()
-        
-        if panel_num == 2:
-            _, current_gamma = self.get_all_slider_values()
+        _, current_gamma = self.get_all_slider_values()
+        self.nicer.set_gamma(current_gamma)
+        preview_image_np = self.nicer.single_image_pass_can(self.reference_img1, abn=False, filterList=filterList)
+        preview_image_pil = Image.fromarray(preview_image_np)
 
-            self.nicer.set_gamma(current_gamma)
-            # self.nicer.set_filters(filterList)
-            preview_image = self.nicer.single_image_pass_can(self.reference_img1, abn=False, filterList=filterList)
-            self.reference_img2 = Image.fromarray(preview_image)
-            self.display_img_two()
-        
-        elif panel_num == 3:
-            _, current_gamma = self.get_all_slider_values()
+        panel_map = {
+            1: (lambda: setattr(self, 'reference_img1_', preview_image_pil), self.display_img_one),
+            2: (lambda: setattr(self, 'reference_img2', preview_image_pil), self.display_img_two),
+            3: (lambda: setattr(self, 'reference_img3', preview_image_pil), self.display_img_three),
+            4: (lambda: setattr(self, 'reference_img4', preview_image_pil), self.display_img_four),
+            5: (lambda: setattr(self, 'reference_img5', preview_image_pil), self.display_img_five),
+        }
 
-            self.nicer.set_gamma(current_gamma)
-            # self.nicer.set_filters(filterList)
-            preview_image = self.nicer.single_image_pass_can(self.reference_img1, abn=False, filterList=filterList)
-            self.reference_img3 = Image.fromarray(preview_image)
-            self.display_img_three()
-            
-        elif panel_num == 4:
-            _, current_gamma = self.get_all_slider_values()
-
-            self.nicer.set_gamma(current_gamma)
-            # self.nicer.set_filters(filterList)
-            preview_image = self.nicer.single_image_pass_can(self.reference_img1, abn=False, filterList=filterList)
-            self.reference_img4 = Image.fromarray(preview_image)
-            self.display_img_four()
-        
-        elif panel_num == 5:
-            _, current_gamma = self.get_all_slider_values()
-
-            self.nicer.set_gamma(current_gamma)
-            # self.nicer.set_filters(filterList)
-            preview_image = self.nicer.single_image_pass_can(self.reference_img1, abn=False, filterList=filterList)
-            self.reference_img5 = Image.fromarray(preview_image)
-            self.display_img_five()
+        if panel_num in panel_map:
+            set_attr_func, display_func = panel_map[panel_num]
+            set_attr_func()
+            display_func()
+        else:
+            print_msg(f"Invalid panel_num: {panel_num}", 1)
 
     def display_img_one(self):
         tk_preview = ImageTk.PhotoImage(self.reference_img1_)
@@ -821,19 +935,20 @@ class NicerGui:
 
     def periodiccall(self):
         self.checkqueue()
-        if self.thread.is_alive() and running:  # running is set to false by stop button
+        if self.thread and self.thread.is_alive():
+            # Thread is still running, check again later.
             self.master.after(100, self.periodiccall)
-        elif not self.thread.is_alive() and running:  # thread terminated naturally, after optimization
-            self.print_label['text'] = "Optimization finished."
-            self.nicer_button.config(state="active")
-            self.nicer.queue = queue.Queue()
         else:
-            self.threadKiller.set()  # thread killed by stop button
-            self.thread.join()
-            self.print_label['text'] = "Stopped optimization."
+            # Thread has finished.
+            if running:  # Finished naturally
+                self.print_label['text'] = "Optimization finished."
+            else:  # Finished because of stop button
+                self.print_label['text'] = "Stopped optimization."
+            
             self.nicer_button.config(state="active")
             self.threadKiller.clear()
             self.nicer.queue = queue.Queue()
+            self.thread = None # Clear thread reference
 
     def nicer_routine(self):
         global running
